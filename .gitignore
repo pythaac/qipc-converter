@@ -1,0 +1,14 @@
+/artifacts/
+/vendor/*
+!/vendor/README.md
+/bin/
+/obj/
+/.vs/
+*.user
+*.suo
+*.bin
+*.mp4
+*.hevc
+*.aac
+*.log
+.qipc-work-*/
