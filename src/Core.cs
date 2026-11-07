@@ -149,6 +149,24 @@ namespace QipcConverter
         {
             if (!condition) throw new InvalidDataException(message + " (위치 " + offset.ToString(CultureInfo.InvariantCulture) + ")");
         }
+        private static string VideoConfiguration(byte[] buffer, int count)
+        {
+            // QIPC keyframes begin with complete Annex B VPS/SPS/PPS NAL units.
+            // Only use an exact, complete configuration match for a short GOP.
+            int position = 0;
+            for (int type = 32; type <= 34; type++)
+            {
+                if (position + 6 > count || buffer[position] != 0 || buffer[position + 1] != 0
+                    || buffer[position + 2] != 0 || buffer[position + 3] != 1
+                    || ((buffer[position + 4] >> 1) & 63) != type) return null;
+                int next = position + 6;
+                while (next + 4 <= count && !(buffer[next] == 0 && buffer[next + 1] == 0
+                    && buffer[next + 2] == 0 && buffer[next + 3] == 1)) next++;
+                if (next + 4 > count) return null;
+                position = next;
+            }
+            return Convert.ToBase64String(buffer, 0, position);
+        }
         public static ExtractionInfo Extract(string input, string video, string audio, Action<double> progress)
         {
             var info = new ExtractionInfo();
@@ -161,6 +179,7 @@ namespace QipcConverter
                 Require(source.Length >= 538, 0, "지원하는 QIPC 녹화 파일이 아닙니다.");
                 source.Position = 512;
                 var buffer = new byte[65536];
+                var configurationRates = new Dictionary<string, int>(StringComparer.Ordinal);
                 ulong lastVideo = 0;
                 while (source.Position + 26 <= source.Length)
                 {
@@ -171,7 +190,8 @@ namespace QipcConverter
                         source.Position = offset;
                         break;
                     }
-                    Require(header[0] == 7 && header[1] == 1 && header[2] == 1, offset, "알 수 없는 녹화 블록입니다.");
+                    Require((header[0] == 5 || header[0] == 7) && header[1] == 1 && header[2] == 1,
+                        offset, "알 수 없는 녹화 블록입니다: " + BitConverter.ToString(header, 0, 3));
                     uint length = BitConverter.ToUInt32(header, 3);
                     uint mediaLength = BitConverter.ToUInt32(header, 22);
                     long end = offset + 26L + length;
@@ -186,6 +206,7 @@ namespace QipcConverter
                     var cadence = new List<ulong>();
                     ulong chunkPrevious = 0;
                     ulong chunkFirst = 0;
+                    string configuration = null;
                     while (source.Position < mediaEnd)
                     {
                         long packetOffset = source.Position;
@@ -209,8 +230,11 @@ namespace QipcConverter
                             if (first)
                             {
                                 if (kind == 2)
+                                {
                                     Require(count >= 6 && buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 0 && buffer[3] == 1,
                                         packetOffset, "HEVC 영상 시작 코드를 찾을 수 없습니다.");
+                                    if (info.VideoFrames == framesBefore) configuration = VideoConfiguration(buffer, count);
+                                }
                                 else
                                     Require(count >= 7 && buffer[0] == 255 && buffer[1] == 241,
                                         packetOffset, "AAC 음성 헤더를 찾을 수 없습니다.");
@@ -233,13 +257,34 @@ namespace QipcConverter
                     }
                     // Infer rate within each GOP; gaps between recordings must not affect it.
                     long blockFrames = info.VideoFrames - framesBefore;
-                    Require(blockFrames >= 3 && chunkPrevious > chunkFirst, offset, "프레임 속도를 판별할 영상이 부족합니다.");
-                    double measured = (blockFrames - 1) * 1000.0 / (chunkPrevious - chunkFirst);
-                    int rate = (int)Math.Round(measured);
-                    cadence.Sort();
-                    Require(rate >= 1 && rate <= 60 && Math.Abs(measured - rate) / rate < .05
-                        && cadence.Count == blockFrames - 1 && Math.Abs(cadence[cadence.Count / 2] - 1000.0 / rate) < 1000.0 / rate * .25,
-                        offset, "일정한 프레임 속도를 판별할 수 없습니다.");
+                    Require(blockFrames > 0, offset, "영상 프레임이 없는 녹화 블록입니다.");
+                    int rate = 0;
+                    if (blockFrames < 3)
+                    {
+                        // A mode switch can finish the old GOP after just 1–2 frames.
+                        // Reuse a measured rate only for identical VPS/SPS/PPS; never
+                        // derive it from the time gap between separate recordings.
+                        Require(configuration != null && configurationRates.TryGetValue(configuration, out rate) && rate > 0,
+                            offset, "짧은 녹화 블록의 프레임 속도를 확인할 수 없습니다.");
+                        Require(cadence.All(delta => Math.Abs(delta - 1000.0 / rate) < 1000.0 / rate * .25),
+                            offset, "짧은 녹화 블록의 프레임 간격이 영상 설정과 맞지 않습니다.");
+                    }
+                    else
+                    {
+                        Require(chunkPrevious > chunkFirst, offset, "프레임 속도를 판별할 영상이 부족합니다.");
+                        double measured = (blockFrames - 1) * 1000.0 / (chunkPrevious - chunkFirst);
+                        rate = (int)Math.Round(measured);
+                        cadence.Sort();
+                        Require(rate >= 1 && rate <= 60 && Math.Abs(measured - rate) / rate < .05
+                            && cadence.Count == blockFrames - 1 && Math.Abs(cadence[cadence.Count / 2] - 1000.0 / rate) < 1000.0 / rate * .25,
+                            offset, "일정한 프레임 속도를 판별할 수 없습니다.");
+                        if (configuration != null)
+                        {
+                            int previousRate;
+                            configurationRates[configuration] = configurationRates.TryGetValue(configuration, out previousRate)
+                                && previousRate != rate ? 0 : rate;
+                        }
+                    }
                     FrameSection section;
                     if (info.Sections.Count == 0 || info.Sections[info.Sections.Count - 1].Rate != rate)
                     {

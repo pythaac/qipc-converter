@@ -10,6 +10,7 @@ New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 $portableDir = Join-Path $Destination 'QIPCConverter-Windows'
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 Get-ChildItem -LiteralPath $builtRelease -File | Copy-Item -Destination $portableDir -Force
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $portableZip = Join-Path $Destination 'QIPCConverter-Windows.zip'
 $sourceZip = Join-Path $Destination 'QipcConverter-source.zip'

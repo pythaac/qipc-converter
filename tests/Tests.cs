@@ -25,16 +25,20 @@ namespace QipcConverter
             catch (EndOfStreamException) { Check(true, name); return; }
             throw new Exception("FAIL: accepted invalid data: " + name);
         }
-        private static byte[] Fixture(bool audio, bool thumbnail, int frameStep)
+        private static byte[] Fixture(bool audio, bool thumbnail, int frameStep, byte marker = 7, int frames = 30, int configuration = 0)
         {
             byte[] media;
             using (var stream = new MemoryStream())
             using (var writer = new BinaryWriter(stream))
             {
-                for (int i = 0; i < 30; i++)
+                for (int i = 0; i < frames; i++)
                 {
                     writer.Write((ulong)(1743790050038L + i * frameStep)); writer.Write((ushort)0); writer.Write((byte)2); writer.Write((byte)(i == 0 ? 1 : 0));
-                    writer.Write((uint)8); writer.Write((uint)0); writer.Write(new byte[] { 0, 0, 0, 1, 64, 1, 1, 1 });
+                    byte[] payload = i == 0
+                        ? new byte[] { 0, 0, 0, 1, 64, 1, 1, 1, 0, 0, 0, 1, 66, 1, 1, (byte)(configuration == 0 ? frameStep : configuration),
+                            0, 0, 0, 1, 68, 1, 1, 1, 0, 0, 0, 1, 38, 1, 1, 1 }
+                        : new byte[] { 0, 0, 0, 1, 2, 1, 1, 1 };
+                    writer.Write((uint)payload.Length); writer.Write((uint)0); writer.Write(payload);
                     if (audio)
                     {
                         writer.Write((ulong)(1743790050040L + i * frameStep)); writer.Write((ushort)0); writer.Write((byte)4); writer.Write((byte)130);
@@ -43,7 +47,7 @@ namespace QipcConverter
                 }
                 media = stream.ToArray();
             }
-            byte[] header = new byte[26]; header[0] = 7; header[1] = header[2] = 1;
+            byte[] header = new byte[26]; header[0] = marker; header[1] = header[2] = 1;
             Buffer.BlockCopy(BitConverter.GetBytes((uint)(media.Length + (thumbnail ? 14 : 0))), 0, header, 3, 4);
             Buffer.BlockCopy(BitConverter.GetBytes((uint)media.Length), 0, header, 22, 4);
             using (var stream = new MemoryStream())
@@ -64,9 +68,8 @@ namespace QipcConverter
                 return QipcReader.Extract(input, Path.Combine(work.Path, "video.hevc"), Path.Combine(work.Path, "audio.aac"), null);
             }
         }
-        private static byte[] MixedFixture()
+        private static byte[] JoinFixtures(params byte[][] inputs)
         {
-            byte[][] inputs = { Fixture(false, false, 67), Fixture(false, false, 50) };
             using (var stream = new MemoryStream())
             using (var writer = new BinaryWriter(stream))
             using (var index = new MemoryStream())
@@ -133,13 +136,41 @@ namespace QipcConverter
                     Check(Parse(root.Path, Fixture(false, false, 33)).FramesPerSecond == 30, "automatically infer 30fps");
                     Check(Parse(root.Path, Fixture(false, false, 50)).FramesPerSecond == 20, "automatically infer 20fps");
                     Check(Parse(root.Path, Fixture(false, false, 67)).FramesPerSecond == 15, "automatically infer 15fps");
-                    var mixed = Parse(root.Path, MixedFixture());
+                    var mixed = Parse(root.Path, JoinFixtures(Fixture(false, false, 67), Fixture(false, false, 50)));
                     Check(mixed.VideoFrames == 60 && mixed.Sections.Count == 2 && mixed.Sections[0].Rate == 15 && mixed.Sections[1].Rate == 20
                         && Math.Abs(mixed.Duration - 3.5) < .00001 && mixed.Sections[1].Offset == mixed.Sections[0].Length,
                         "mixed 15/20fps sections preserve timing and byte ranges");
                     Reject(() => Parse(root.Path, Fixture(false, false, 1)), "implausible frame rate rejected");
                     corrupt = Fixture(false, false, 67); corrupt[558] = 8;
                     Reject(() => Parse(root.Path, corrupt), "missing HEVC start code");
+
+                    foreach (byte marker in new byte[] { 5, 7 })
+                    {
+                        info = Parse(root.Path, Fixture(true, true, 67, marker));
+                        Check(info.VideoFrames == 30 && info.AudioPackets == 30 && info.Thumbnails == 1 && info.FramesPerSecond == 15,
+                            "block marker " + marker + ": audio, thumbnail, index and video");
+                        foreach (int shortFrames in new[] { 1, 2 })
+                        {
+                            info = Parse(root.Path, JoinFixtures(Fixture(false, false, 50, marker),
+                                Fixture(false, false, 52, marker, shortFrames, 50), Fixture(false, false, 67, marker)));
+                            Check(info.VideoFrames == 60 + shortFrames && info.Sections.Count == 2
+                                && info.Sections[0].Frames == 30 + shortFrames && info.Sections[0].Rate == 20
+                                && info.Sections[1].Rate == 15 && Math.Abs(info.Duration - ((30 + shortFrames) / 20.0 + 2)) < .00001,
+                                "block marker " + marker + ": " + shortFrames + "-frame GOP at mode switch preserves every frame and timing");
+                        }
+                    }
+                    corrupt = Fixture(true, true, 67, 5); corrupt[512] = 6;
+                    Reject(() => Parse(root.Path, corrupt), "unrecognized block marker still rejected");
+                    corrupt = Fixture(true, true, 67, 5); corrupt[corrupt.Length - 10] ^= 1;
+                    Reject(() => Parse(root.Path, corrupt), "marker 5 index corruption still rejected");
+                    Reject(() => Parse(root.Path, Fixture(false, false, 67, 5, 1)), "short GOP without a known rate rejected");
+                    Reject(() => Parse(root.Path, JoinFixtures(Fixture(false, false, 50, 5), Fixture(false, false, 67, 5, 1))),
+                        "short GOP with a different configuration rejected");
+                    Reject(() => Parse(root.Path, JoinFixtures(Fixture(false, false, 50, 5), Fixture(false, false, 67, 5, 2, 50))),
+                        "short GOP with inconsistent cadence rejected");
+                    Reject(() => Parse(root.Path, JoinFixtures(Fixture(false, false, 50, 5, 30, 1),
+                        Fixture(false, false, 67, 5, 30, 1), Fixture(false, false, 67, 5, 1, 1))),
+                        "ambiguous configuration rate is never guessed");
 
                     string inputDir = Path.Combine(root.Path, "한글 입력 폴더"); string nested = Path.Combine(inputDir, "nested"); Directory.CreateDirectory(nested);
                     string first = Path.Combine(inputDir, "one.bin"); string second = Path.Combine(nested, "TWO.BIN");

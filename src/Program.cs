@@ -6,8 +6,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("QIPC Converter")]
 [assembly: AssemblyDescription("QIPC BIN to original-resolution MP4")]
 [assembly: AssemblyProduct("QIPC Converter")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 namespace QipcConverter
 {
